@@ -79,22 +79,6 @@ const char* PeepholeActionTableWriter::kNamespaceElements[] = {"v8", "internal",
 // static
 PeepholeActionAndData PeepholeActionTableWriter::LookupActionAndData(
     Bytecode last, Bytecode current) {
-  // ToName bytecodes can be replaced by Star with the same output register if
-  // the value in the accumulator is already a name.
-  if (current == Bytecode::kToName && Bytecodes::PutsNameInAccumulator(last)) {
-    return {PeepholeAction::kChangeBytecodeAction, Bytecode::kStar};
-  }
-
-  // Nop are placeholders for holding source position information and can be
-  // elided if there is no source information.
-  if (last == Bytecode::kNop) {
-    if (Bytecodes::IsJump(current)) {
-      return {PeepholeAction::kElideLastBeforeJumpAction, Bytecode::kIllegal};
-    } else {
-      return {PeepholeAction::kElideLastAction, Bytecode::kIllegal};
-    }
-  }
-
   // The accumulator is invisible to the debugger. If there is a sequence
   // of consecutive accumulator loads (that don't have side effects) then
   // only the final load is potentially visible.
@@ -121,98 +105,6 @@ PeepholeActionAndData PeepholeActionTableWriter::LookupActionAndData(
 
   // TODO(rmcilroy): Add elide for consecutive mov to and from the same
   // register.
-
-  // Remove ToBoolean coercion from conditional jumps where possible.
-  if (Bytecodes::WritesBooleanToAccumulator(last)) {
-    if (Bytecodes::IsJumpIfToBoolean(current)) {
-      return {PeepholeAction::kChangeJumpBytecodeAction,
-              Bytecodes::GetJumpWithoutToBoolean(current)};
-    } else if (current == Bytecode::kToBooleanLogicalNot) {
-      return {PeepholeAction::kChangeBytecodeAction, Bytecode::kLogicalNot};
-    }
-  }
-
-  // Fuse LdaSmi followed by binary op to produce binary op with a
-  // immediate integer argument. This savaes on dispatches and size.
-  if (last == Bytecode::kLdaSmi) {
-    switch (current) {
-      case Bytecode::kAdd:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kAddSmi};
-      case Bytecode::kSub:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kSubSmi};
-      case Bytecode::kBitwiseAnd:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kBitwiseAndSmi};
-      case Bytecode::kBitwiseOr:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kBitwiseOrSmi};
-      case Bytecode::kShiftLeft:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kShiftLeftSmi};
-      case Bytecode::kShiftRight:
-        return {PeepholeAction::kTransformLdaSmiBinaryOpToBinaryOpWithSmiAction,
-                Bytecode::kShiftRightSmi};
-      default:
-        break;
-    }
-  }
-
-  // Fuse LdaZero followed by binary op to produce binary op with a
-  // zero immediate argument. This saves dispatches, but not size.
-  if (last == Bytecode::kLdaZero) {
-    switch (current) {
-      case Bytecode::kAdd:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kAddSmi};
-      case Bytecode::kSub:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kSubSmi};
-      case Bytecode::kBitwiseAnd:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kBitwiseAndSmi};
-      case Bytecode::kBitwiseOr:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kBitwiseOrSmi};
-      case Bytecode::kShiftLeft:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kShiftLeftSmi};
-      case Bytecode::kShiftRight:
-        return {
-            PeepholeAction::kTransformLdaZeroBinaryOpToBinaryOpWithZeroAction,
-            Bytecode::kShiftRightSmi};
-      default:
-        break;
-    }
-  }
-
-  // Fuse LdaNull/LdaUndefined followed by a equality comparison with test
-  // undetectable. Testing undetectable is a simple check on the map which is
-  // more efficient than the full comparison operation.
-  if (last == Bytecode::kLdaNull || last == Bytecode::kLdaUndefined) {
-    if (current == Bytecode::kTestEqual) {
-      return {PeepholeAction::kTransformEqualityWithNullOrUndefinedAction,
-              Bytecode::kTestUndetectable};
-    }
-  }
-
-  // Fuse LdaNull/LdaUndefined followed by a strict equals with
-  // TestNull/TestUndefined.
-  if (current == Bytecode::kTestEqualStrict) {
-    if (last == Bytecode::kLdaNull) {
-      return {PeepholeAction::kTransformEqualityWithNullOrUndefinedAction,
-              Bytecode::kTestNull};
-    } else if (last == Bytecode::kLdaUndefined) {
-      return {PeepholeAction::kTransformEqualityWithNullOrUndefinedAction,
-              Bytecode::kTestUndefined};
-    }
-  }
 
   // If there is no last bytecode to optimize against, store the incoming
   // bytecode or for jumps emit incoming bytecode immediately.

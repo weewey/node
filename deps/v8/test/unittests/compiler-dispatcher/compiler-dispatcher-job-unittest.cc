@@ -30,24 +30,27 @@ class CompilerDispatcherJobTest : public TestWithContext {
   CompilerDispatcherTracer* tracer() { return &tracer_; }
 
   static void SetUpTestCase() {
-    old_flag_ = i::FLAG_ignition;
-    i::FLAG_ignition = true;
+    CHECK_NULL(save_flags_);
+    save_flags_ = new SaveFlags();
+    FLAG_ignition = true;
     TestWithContext::SetUpTestCase();
   }
 
   static void TearDownTestCase() {
     TestWithContext::TearDownTestCase();
-    i::FLAG_ignition = old_flag_;
+    CHECK_NOT_NULL(save_flags_);
+    delete save_flags_;
+    save_flags_ = nullptr;
   }
 
  private:
   CompilerDispatcherTracer tracer_;
-  static bool old_flag_;
+  static SaveFlags* save_flags_;
 
   DISALLOW_COPY_AND_ASSIGN(CompilerDispatcherJobTest);
 };
 
-bool CompilerDispatcherJobTest::old_flag_;
+SaveFlags* CompilerDispatcherJobTest::save_flags_ = nullptr;
 
 namespace {
 
@@ -69,17 +72,20 @@ class ScriptResource : public v8::String::ExternalOneByteStringResource {
   DISALLOW_COPY_AND_ASSIGN(ScriptResource);
 };
 
+Handle<String> CreateSource(Isolate* isolate,
+                            ExternalOneByteString::Resource* maybe_resource) {
+  if (maybe_resource) {
+    return isolate->factory()
+        ->NewExternalStringFromOneByte(maybe_resource)
+        .ToHandleChecked();
+  }
+  return isolate->factory()->NewStringFromAsciiChecked(test_script);
+}
+
 Handle<SharedFunctionInfo> CreateSharedFunctionInfo(
     Isolate* isolate, ExternalOneByteString::Resource* maybe_resource) {
   HandleScope scope(isolate);
-  Handle<String> source;
-  if (maybe_resource) {
-    source = isolate->factory()
-                 ->NewExternalStringFromOneByte(maybe_resource)
-                 .ToHandleChecked();
-  } else {
-    source = isolate->factory()->NewStringFromAsciiChecked(test_script);
-  }
+  Handle<String> source = CreateSource(isolate, maybe_resource);
   Handle<Script> script = isolate->factory()->NewScript(source);
   Handle<FixedArray> infos = isolate->factory()->NewFixedArray(3);
   script->set_shared_function_infos(*infos);
@@ -93,12 +99,35 @@ Handle<SharedFunctionInfo> CreateSharedFunctionInfo(
   return scope.CloseAndEscape(shared);
 }
 
+class FinishCallback : public CompilerDispatcherJob::FinishCallback {
+ public:
+  void ParseFinished(std::unique_ptr<ParseInfo> result) override {
+    result_ = std::move(result);
+  }
+  ParseInfo* result() const { return result_.get(); }
+
+ private:
+  std::unique_ptr<ParseInfo> result_;
+};
+
 }  // namespace
 
 TEST_F(CompilerDispatcherJobTest, Construct) {
   std::unique_ptr<CompilerDispatcherJob> job(new CompilerDispatcherJob(
       i_isolate(), tracer(), CreateSharedFunctionInfo(i_isolate(), nullptr),
       FLAG_stack_size));
+}
+
+TEST_F(CompilerDispatcherJobTest, ConstructWithoutSFI) {
+  std::unique_ptr<FinishCallback> callback(new FinishCallback());
+  std::unique_ptr<ScriptResource> resource(
+      new ScriptResource(test_script, strlen(test_script)));
+  std::unique_ptr<CompilerDispatcherJob> job(new CompilerDispatcherJob(
+      tracer(), FLAG_stack_size, CreateSource(i_isolate(), resource.get()), 0,
+      static_cast<int>(resource->length()), SLOPPY, 1, false, false, false,
+      false, i_isolate()->heap()->HashSeed(), i_isolate()->allocator(),
+      ScriptCompiler::kNoCompileOptions, i_isolate()->ast_string_constants(),
+      callback.get()));
 }
 
 TEST_F(CompilerDispatcherJobTest, StateTransitions) {
@@ -112,7 +141,9 @@ TEST_F(CompilerDispatcherJobTest, StateTransitions) {
   job->Parse();
   ASSERT_TRUE(job->status() == CompileJobStatus::kParsed);
   ASSERT_TRUE(job->FinalizeParsingOnMainThread());
-  ASSERT_TRUE(job->status() == CompileJobStatus::kReadyToAnalyse);
+  ASSERT_TRUE(job->status() == CompileJobStatus::kReadyToAnalyze);
+  ASSERT_TRUE(job->AnalyzeOnMainThread());
+  ASSERT_TRUE(job->status() == CompileJobStatus::kAnalyzed);
   ASSERT_TRUE(job->PrepareToCompileOnMainThread());
   ASSERT_TRUE(job->status() == CompileJobStatus::kReadyToCompile);
   job->Compile();
@@ -121,6 +152,24 @@ TEST_F(CompilerDispatcherJobTest, StateTransitions) {
   ASSERT_TRUE(job->status() == CompileJobStatus::kDone);
   job->ResetOnMainThread();
   ASSERT_TRUE(job->status() == CompileJobStatus::kInitial);
+}
+
+TEST_F(CompilerDispatcherJobTest, StateTransitionsParseWithCallback) {
+  std::unique_ptr<FinishCallback> callback(new FinishCallback());
+  std::unique_ptr<ScriptResource> resource(
+      new ScriptResource(test_script, strlen(test_script)));
+  std::unique_ptr<CompilerDispatcherJob> job(new CompilerDispatcherJob(
+      tracer(), FLAG_stack_size, CreateSource(i_isolate(), resource.get()), 0,
+      static_cast<int>(resource->length()), SLOPPY, 1, false, false, false,
+      false, i_isolate()->heap()->HashSeed(), i_isolate()->allocator(),
+      ScriptCompiler::kNoCompileOptions, i_isolate()->ast_string_constants(),
+      callback.get()));
+  ASSERT_TRUE(job->status() == CompileJobStatus::kReadyToParse);
+  job->Parse();
+  ASSERT_TRUE(job->status() == CompileJobStatus::kDone);
+  job->ResetOnMainThread();
+  ASSERT_TRUE(job->status() == CompileJobStatus::kInitial);
+  ASSERT_TRUE(callback->result() != nullptr);
 }
 
 TEST_F(CompilerDispatcherJobTest, SyntaxError) {
@@ -153,6 +202,7 @@ TEST_F(CompilerDispatcherJobTest, ScopeChain) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   ASSERT_TRUE(job->FinalizeParsingOnMainThread());
+  ASSERT_TRUE(job->AnalyzeOnMainThread());
   ASSERT_TRUE(job->PrepareToCompileOnMainThread());
   ASSERT_TRUE(job->status() == CompileJobStatus::kReadyToCompile);
 
@@ -189,6 +239,7 @@ TEST_F(CompilerDispatcherJobTest, CompileAndRun) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   job->FinalizeParsingOnMainThread();
+  job->AnalyzeOnMainThread();
   job->PrepareToCompileOnMainThread();
   job->Compile();
   ASSERT_TRUE(job->FinalizeCompilingOnMainThread());
@@ -201,7 +252,7 @@ TEST_F(CompilerDispatcherJobTest, CompileAndRun) {
   ASSERT_TRUE(job->status() == CompileJobStatus::kInitial);
 }
 
-TEST_F(CompilerDispatcherJobTest, CompileFailureToPrepare) {
+TEST_F(CompilerDispatcherJobTest, CompileFailureToAnalyse) {
   std::string raw_script("() { var a = ");
   for (int i = 0; i < 100000; i++) {
     raw_script += "'x' + ";
@@ -215,7 +266,7 @@ TEST_F(CompilerDispatcherJobTest, CompileFailureToPrepare) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   job->FinalizeParsingOnMainThread();
-  ASSERT_FALSE(job->PrepareToCompileOnMainThread());
+  ASSERT_FALSE(job->AnalyzeOnMainThread());
   ASSERT_TRUE(job->status() == CompileJobStatus::kFailed);
   ASSERT_TRUE(i_isolate()->has_pending_exception());
 
@@ -238,6 +289,7 @@ TEST_F(CompilerDispatcherJobTest, CompileFailureToFinalize) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   job->FinalizeParsingOnMainThread();
+  job->AnalyzeOnMainThread();
   job->PrepareToCompileOnMainThread();
   job->Compile();
   ASSERT_FALSE(job->FinalizeCompilingOnMainThread());
@@ -282,6 +334,7 @@ TEST_F(CompilerDispatcherJobTest, CompileOnBackgroundThread) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   job->FinalizeParsingOnMainThread();
+  job->AnalyzeOnMainThread();
   job->PrepareToCompileOnMainThread();
 
   base::Semaphore semaphore(0);
@@ -314,6 +367,7 @@ TEST_F(CompilerDispatcherJobTest, LazyInnerFunctions) {
   job->PrepareToParseOnMainThread();
   job->Parse();
   ASSERT_TRUE(job->FinalizeParsingOnMainThread());
+  ASSERT_TRUE(job->AnalyzeOnMainThread());
   ASSERT_TRUE(job->PrepareToCompileOnMainThread());
   job->Compile();
   ASSERT_TRUE(job->FinalizeCompilingOnMainThread());
